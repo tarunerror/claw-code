@@ -3,6 +3,7 @@ mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -13,8 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -22,6 +22,7 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
+use reqwest::blocking::Client;
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
@@ -30,17 +31,30 @@ use runtime::{
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
+use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const DEFAULT_MAX_TOKENS: u32 = 32;
-const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+const SELF_UPDATE_REPOSITORY: &str = "instructkr/clawd-code";
+const SELF_UPDATE_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/instructkr/clawd-code/releases/latest";
+const SELF_UPDATE_USER_AGENT: &str = "rusty-claude-cli-self-update";
+const CHECKSUM_ASSET_CANDIDATES: &[&str] = &[
+    "SHA256SUMS",
+    "SHA256SUMS.txt",
+    "sha256sums",
+    "sha256sums.txt",
+    "checksums.txt",
+    "checksums.sha256",
+];
 
 type AllowedToolSet = BTreeSet<String>;
 
@@ -62,6 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
+        CliAction::SelfUpdate => run_self_update()?,
         CliAction::ResumeSession {
             session_path,
             commands,
@@ -72,8 +87,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-            thinking,
-        } => LiveCli::new(model, false, allowed_tools, permission_mode, thinking)?
+        } => LiveCli::new(model, false, allowed_tools, permission_mode)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
@@ -81,8 +95,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-            thinking,
-        } => run_repl(model, allowed_tools, permission_mode, thinking)?,
+        } => run_repl(model, allowed_tools, permission_mode)?,
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -97,6 +110,7 @@ enum CliAction {
         date: String,
     },
     Version,
+    SelfUpdate,
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
@@ -107,7 +121,6 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        thinking: bool,
     },
     Login,
     Logout,
@@ -115,7 +128,6 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        thinking: bool,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -145,7 +157,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
-    let mut thinking = false;
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
     let mut index = 0;
@@ -154,10 +165,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         match args[index].as_str() {
             "--version" | "-V" => {
                 wants_version = true;
-                index += 1;
-            }
-            "--thinking" => {
-                thinking = true;
                 index += 1;
             }
             "--model" => {
@@ -226,7 +233,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
-            thinking,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -240,6 +246,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
+        "self-update" => Ok(CliAction::SelfUpdate),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
         "prompt" => {
@@ -253,7 +260,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
-                thinking,
             })
         }
         other if !other.starts_with('/') => Ok(CliAction::Prompt {
@@ -262,7 +268,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
-            thinking,
         }),
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -548,6 +553,375 @@ fn print_version() {
     println!("{}", render_version_report());
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubRelease {
+    tag_name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedReleaseAssets {
+    binary: GitHubReleaseAsset,
+    checksum: GitHubReleaseAsset,
+}
+
+fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(release) = fetch_latest_release()? else {
+        println!(
+            "{}",
+            render_update_report(
+                "No published release available",
+                Some(VERSION),
+                None,
+                Some("GitHub latest release endpoint returned no published release for instructkr/clawd-code."),
+                None,
+            )
+        );
+        return Ok(());
+    };
+
+    let latest_version = normalize_version_tag(&release.tag_name);
+    if !is_newer_version(VERSION, &latest_version) {
+        println!(
+            "{}",
+            render_update_report(
+                "Already up to date",
+                Some(VERSION),
+                Some(&latest_version),
+                Some("Current binary already matches the latest published release."),
+                Some(&release.body),
+            )
+        );
+        return Ok(());
+    }
+
+    let selected = match select_release_assets(&release) {
+        Ok(selected) => selected,
+        Err(message) => {
+            println!(
+                "{}",
+                render_update_report(
+                    "Release found, but no installable asset matched this platform",
+                    Some(VERSION),
+                    Some(&latest_version),
+                    Some(&message),
+                    Some(&release.body),
+                )
+            );
+            return Ok(());
+        }
+    };
+
+    let client = build_self_update_client()?;
+    let binary_bytes = download_bytes(&client, &selected.binary.browser_download_url)?;
+    let checksum_manifest = download_text(&client, &selected.checksum.browser_download_url)?;
+    let expected_checksum = parse_checksum_for_asset(&checksum_manifest, &selected.binary.name)
+        .ok_or_else(|| {
+            format!(
+                "checksum manifest did not contain an entry for {}",
+                selected.binary.name
+            )
+        })?;
+    let actual_checksum = sha256_hex(&binary_bytes);
+    if actual_checksum != expected_checksum {
+        return Err(format!(
+            "downloaded asset checksum mismatch for {} (expected {}, got {})",
+            selected.binary.name, expected_checksum, actual_checksum
+        )
+        .into());
+    }
+
+    replace_current_executable(&binary_bytes)?;
+
+    println!(
+        "{}",
+        render_update_report(
+            "Update installed",
+            Some(VERSION),
+            Some(&latest_version),
+            Some(&format!(
+                "Installed {} from GitHub release assets for {}.",
+                selected.binary.name,
+                current_target()
+            )),
+            Some(&release.body),
+        )
+    );
+    Ok(())
+}
+
+fn fetch_latest_release() -> Result<Option<GitHubRelease>, Box<dyn std::error::Error>> {
+    let client = build_self_update_client()?;
+    let response = client
+        .get(SELF_UPDATE_LATEST_RELEASE_URL)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    let response = response.error_for_status()?;
+    Ok(Some(response.json()?))
+}
+
+fn build_self_update_client() -> Result<Client, reqwest::Error> {
+    Client::builder().user_agent(SELF_UPDATE_USER_AGENT).build()
+}
+
+fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(response.bytes()?.to_vec())
+}
+
+fn download_text(client: &Client, url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(response.text()?)
+}
+
+fn normalize_version_tag(version: &str) -> String {
+    version.trim().trim_start_matches('v').to_string()
+}
+
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    compare_versions(latest, current).is_gt()
+}
+
+fn current_target() -> String {
+    BUILD_TARGET.map_or_else(default_target_triple, str::to_string)
+}
+
+fn release_asset_candidates() -> Vec<String> {
+    let mut candidates = target_name_candidates()
+        .into_iter()
+        .flat_map(|target| {
+            let mut names = vec![format!("rusty-claude-cli-{target}")];
+            if env::consts::OS == "windows" {
+                names.push(format!("rusty-claude-cli-{target}.exe"));
+            }
+            names
+        })
+        .collect::<Vec<_>>();
+    if env::consts::OS == "windows" {
+        candidates.push("rusty-claude-cli.exe".to_string());
+    }
+    candidates.push("rusty-claude-cli".to_string());
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn select_release_assets(release: &GitHubRelease) -> Result<SelectedReleaseAssets, String> {
+    let binary = release_asset_candidates()
+        .into_iter()
+        .find_map(|candidate| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name == candidate)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!(
+                "no binary asset matched target {} (expected one of: {})",
+                current_target(),
+                release_asset_candidates().join(", ")
+            )
+        })?;
+
+    let checksum = CHECKSUM_ASSET_CANDIDATES
+        .iter()
+        .find_map(|candidate| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name == *candidate)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!(
+                "release did not include a checksum manifest (expected one of: {})",
+                CHECKSUM_ASSET_CANDIDATES.join(", ")
+            )
+        })?;
+
+    Ok(SelectedReleaseAssets { binary, checksum })
+}
+
+fn parse_checksum_for_asset(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some((left, right)) = trimmed.split_once(" = ") {
+            return left
+                .strip_prefix("SHA256 (")
+                .and_then(|value| value.strip_suffix(')'))
+                .filter(|file| *file == asset_name)
+                .map(|_| right.to_ascii_lowercase());
+        }
+        let mut parts = trimmed.split_whitespace();
+        let checksum = parts.next()?;
+        let file = parts
+            .next_back()
+            .or_else(|| parts.next())?
+            .trim_start_matches('*');
+        (file == asset_name).then(|| checksum.to_ascii_lowercase())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn replace_current_executable(binary_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let current = env::current_exe()?;
+    replace_executable_at(&current, binary_bytes)
+}
+
+fn replace_executable_at(
+    current: &Path,
+    binary_bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_path = current.with_extension("download");
+    let backup_path = current.with_extension("bak");
+
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)?;
+    }
+    fs::write(&temp_path, binary_bytes)?;
+    copy_executable_permissions(current, &temp_path)?;
+
+    fs::rename(current, &backup_path)?;
+    if let Err(error) = fs::rename(&temp_path, current) {
+        let _ = fs::rename(&backup_path, current);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("failed to replace current executable: {error}").into());
+    }
+
+    if let Err(error) = fs::remove_file(&backup_path) {
+        eprintln!(
+            "warning: failed to remove self-update backup {}: {error}",
+            backup_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_executable_permissions(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(source)?.permissions().mode();
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_executable_permissions(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+fn render_update_report(
+    result: &str,
+    current_version: Option<&str>,
+    latest_version: Option<&str>,
+    detail: Option<&str>,
+    changelog: Option<&str>,
+) -> String {
+    let mut report = String::from(
+        "Self-update
+",
+    );
+    let _ = writeln!(report, "  Repository       {SELF_UPDATE_REPOSITORY}");
+    let _ = writeln!(report, "  Result           {result}");
+    if let Some(current_version) = current_version {
+        let _ = writeln!(report, "  Current version  {current_version}");
+    }
+    if let Some(latest_version) = latest_version {
+        let _ = writeln!(report, "  Latest version   {latest_version}");
+    }
+    if let Some(detail) = detail {
+        let _ = writeln!(report, "  Detail           {detail}");
+    }
+    let trimmed = changelog.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(changelog) = trimmed {
+        report.push_str(
+            "
+Changelog
+",
+        );
+        report.push_str(changelog);
+    }
+    report.trim_end().to_string()
+}
+
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = normalize_version_tag(left);
+    let right = normalize_version_tag(right);
+    let left_parts = version_components(&left);
+    let right_parts = version_components(&right);
+    let max_len = left_parts.len().max(right_parts.len());
+    for index in 0..max_len {
+        let left_part = *left_parts.get(index).unwrap_or(&0);
+        let right_part = *right_parts.get(index).unwrap_or(&0);
+        match left_part.cmp(&right_part) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn version_components(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-'])
+        .map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn default_target_triple() -> String {
+    let os = match env::consts::OS {
+        "linux" => "unknown-linux-gnu",
+        "macos" => "apple-darwin",
+        "windows" => "pc-windows-msvc",
+        other => other,
+    };
+    format!("{}-{os}", env::consts::ARCH)
+}
+
+fn target_name_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(target) = BUILD_TARGET {
+        candidates.push(target.to_string());
+    }
+    candidates.push(default_target_triple());
+    candidates.push(format!("{}-{}", env::consts::ARCH, env::consts::OS));
+    candidates
+}
+
 fn resume_session(session_path: &Path, commands: &[String]) {
     let session = match Session::load_from_path(session_path) {
         Ok(session) => session,
@@ -614,7 +988,6 @@ struct StatusUsage {
     latest: TokenUsage,
     cumulative: TokenUsage,
     estimated_tokens: usize,
-    thinking_enabled: bool,
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
@@ -679,39 +1052,6 @@ Modes
 Usage
   Inspect current mode with /permissions
   Switch modes with /permissions <mode>"
-    )
-}
-
-fn format_thinking_report(enabled: bool) -> String {
-    let state = if enabled { "on" } else { "off" };
-    let budget = if enabled {
-        DEFAULT_THINKING_BUDGET_TOKENS.to_string()
-    } else {
-        "disabled".to_string()
-    };
-    format!(
-        "Thinking
-  Active mode      {state}
-  Budget tokens    {budget}
-
-Usage
-  Inspect current mode with /thinking
-  Toggle with /thinking on or /thinking off"
-    )
-}
-
-fn format_thinking_switch_report(enabled: bool) -> String {
-    let state = if enabled { "enabled" } else { "disabled" };
-    format!(
-        "Thinking updated
-  Result           {state}
-  Budget tokens    {}
-  Applies to       subsequent requests",
-        if enabled {
-            DEFAULT_THINKING_BUDGET_TOKENS.to_string()
-        } else {
-            "disabled".to_string()
-        }
     )
 }
 
@@ -882,7 +1222,6 @@ fn run_resume_command(
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
-                        thinking_enabled: false,
                     },
                     default_permission_mode().as_str(),
                     &status_context(Some(session_path))?,
@@ -929,7 +1268,6 @@ fn run_resume_command(
             })
         }
         SlashCommand::Resume { .. }
-        | SlashCommand::Thinking { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
@@ -941,15 +1279,8 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    thinking_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(
-        model,
-        true,
-        allowed_tools,
-        permission_mode,
-        thinking_enabled,
-    )?;
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     let mut editor = input::LineEditor::new("› ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
@@ -1002,7 +1333,6 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    thinking_enabled: bool,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
@@ -1014,7 +1344,6 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        thinking_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
@@ -1025,13 +1354,11 @@ impl LiveCli {
             enable_tools,
             allowed_tools.clone(),
             permission_mode,
-            thinking_enabled,
         )?;
         let cli = Self {
             model,
             allowed_tools,
             permission_mode,
-            thinking_enabled,
             system_prompt,
             runtime,
             session,
@@ -1042,10 +1369,9 @@ impl LiveCli {
 
     fn startup_banner(&self) -> String {
         format!(
-            "Rusty Claude CLI\n  Model            {}\n  Permission mode  {}\n  Thinking         {}\n  Working directory {}\n  Session          {}\n\nType /help for commands. Shift+Enter or Ctrl+J inserts a newline.",
+            "Rusty Claude CLI\n  Model            {}\n  Permission mode  {}\n  Working directory {}\n  Session          {}\n\nType /help for commands. Shift+Enter or Ctrl+J inserts a newline.",
             self.model,
             self.permission_mode.as_str(),
-            if self.thinking_enabled { "on" } else { "off" },
             env::current_dir().map_or_else(
                 |_| "<unknown>".to_string(),
                 |path| path.display().to_string(),
@@ -1111,9 +1437,6 @@ impl LiveCli {
             system: (!self.system_prompt.is_empty()).then(|| self.system_prompt.join("\n\n")),
             tools: None,
             tool_choice: None,
-            thinking: self
-                .thinking_enabled
-                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
             stream: false,
         };
         let runtime = tokio::runtime::Runtime::new()?;
@@ -1123,7 +1446,7 @@ impl LiveCli {
             .iter()
             .filter_map(|block| match block {
                 OutputContentBlock::Text { text } => Some(text.as_str()),
-                OutputContentBlock::Thinking { .. } | OutputContentBlock::ToolUse { .. } => None,
+                OutputContentBlock::ToolUse { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("");
@@ -1160,7 +1483,6 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
-            SlashCommand::Thinking { enabled } => self.set_thinking(enabled)?,
             SlashCommand::Model { model } => self.set_model(model)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
@@ -1221,7 +1543,6 @@ impl LiveCli {
                     latest,
                     cumulative,
                     estimated_tokens: self.runtime.estimated_tokens(),
-                    thinking_enabled: self.thinking_enabled,
                 },
                 self.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
@@ -1264,39 +1585,12 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.thinking_enabled,
         )?;
         self.model.clone_from(&model);
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
         );
-        Ok(true)
-    }
-
-    fn set_thinking(&mut self, enabled: Option<bool>) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(enabled) = enabled else {
-            println!("{}", format_thinking_report(self.thinking_enabled));
-            return Ok(false);
-        };
-
-        if enabled == self.thinking_enabled {
-            println!("{}", format_thinking_report(self.thinking_enabled));
-            return Ok(false);
-        }
-
-        let session = self.runtime.session().clone();
-        self.thinking_enabled = enabled;
-        self.runtime = build_runtime(
-            session,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-        )?;
-        println!("{}", format_thinking_switch_report(self.thinking_enabled));
         Ok(true)
     }
 
@@ -1333,7 +1627,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.thinking_enabled,
         )?;
         println!(
             "{}",
@@ -1358,7 +1651,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.thinking_enabled,
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -1393,7 +1685,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.thinking_enabled,
         )?;
         self.session = handle;
         println!(
@@ -1470,7 +1761,6 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
-                    self.thinking_enabled,
                 )?;
                 self.session = handle;
                 println!(
@@ -1500,7 +1790,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.thinking_enabled,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -1612,7 +1901,6 @@ fn render_repl_help() -> String {
     [
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
-        "  /thinking [on|off]   Show or toggle extended thinking".to_string(),
         "  /quit                Quit the REPL".to_string(),
         "  Up/Down              Navigate prompt history".to_string(),
         "  Tab                  Complete slash commands".to_string(),
@@ -1659,14 +1947,10 @@ fn format_status_report(
             "Status
   Model            {model}
   Permission mode  {permission_mode}
-  Thinking         {}
   Messages         {}
   Turns            {}
   Estimated tokens {}",
-            if usage.thinking_enabled { "on" } else { "off" },
-            usage.message_count,
-            usage.turns,
-            usage.estimated_tokens,
+            usage.message_count, usage.turns, usage.estimated_tokens,
         ),
         format!(
             "Usage
@@ -1938,15 +2222,6 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
-                ContentBlock::Thinking { text, signature } => {
-                    lines.push(format!(
-                        "[thinking{}] {}",
-                        signature
-                            .as_ref()
-                            .map_or(String::new(), |value| format!(" signature={value}")),
-                        text
-                    ));
-                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -2037,12 +2312,11 @@ fn build_runtime(
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    thinking_enabled: bool,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     Ok(ConversationRuntime::new(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone(), thinking_enabled)?,
+        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone())?,
         CliToolExecutor::new(allowed_tools),
         permission_policy(permission_mode),
         system_prompt,
@@ -2101,7 +2375,6 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
-    thinking_enabled: bool,
 }
 
 impl AnthropicRuntimeClient {
@@ -2109,7 +2382,6 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
-        thinking_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -2117,7 +2389,6 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             allowed_tools,
-            thinking_enabled,
         })
     }
 }
@@ -2151,9 +2422,6 @@ impl ApiClient for AnthropicRuntimeClient {
                     .collect()
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            thinking: self
-                .thinking_enabled
-                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
             stream: true,
         };
 
@@ -2166,7 +2434,6 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut stdout = io::stdout();
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
-            let mut pending_thinking_signature: Option<String> = None;
             let mut saw_stop = false;
 
             while let Some(event) = stream
@@ -2177,13 +2444,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(
-                                block,
-                                &mut stdout,
-                                &mut events,
-                                &mut pending_tool,
-                                &mut pending_thinking_signature,
-                            )?;
+                            push_output_block(block, &mut stdout, &mut events, &mut pending_tool)?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
@@ -2192,7 +2453,6 @@ impl ApiClient for AnthropicRuntimeClient {
                             &mut stdout,
                             &mut events,
                             &mut pending_tool,
-                            &mut pending_thinking_signature,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -2203,14 +2463,6 @@ impl ApiClient for AnthropicRuntimeClient {
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 events.push(AssistantEvent::TextDelta(text));
                             }
-                        }
-                        ContentBlockDelta::ThinkingDelta { thinking } => {
-                            if !thinking.is_empty() {
-                                events.push(AssistantEvent::ThinkingDelta(thinking));
-                            }
-                        }
-                        ContentBlockDelta::SignatureDelta { signature } => {
-                            events.push(AssistantEvent::ThinkingSignature(signature));
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
                             if let Some((_, _, input)) = &mut pending_tool {
@@ -2241,8 +2493,6 @@ impl ApiClient for AnthropicRuntimeClient {
             if !saw_stop
                 && events.iter().any(|event| {
                     matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                        || matches!(event, AssistantEvent::ThinkingDelta(text) if !text.is_empty())
-                        || matches!(event, AssistantEvent::ThinkingSignature(_))
                         || matches!(event, AssistantEvent::ToolUse { .. })
                 })
             {
@@ -2326,19 +2576,11 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
     }
 }
 
-fn render_thinking_block_summary(text: &str, out: &mut impl Write) -> Result<(), RuntimeError> {
-    let summary = format!("▶ Thinking ({} chars hidden)", text.chars().count());
-    writeln!(out, "\n{summary}")
-        .and_then(|()| out.flush())
-        .map_err(|error| RuntimeError::new(error.to_string()))
-}
-
 fn push_output_block(
     block: OutputContentBlock,
     out: &mut impl Write,
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
-    pending_thinking_signature: &mut Option<String>,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -2347,19 +2589,6 @@ fn push_output_block(
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
-            }
-        }
-        OutputContentBlock::Thinking {
-            thinking,
-            signature,
-        } => {
-            render_thinking_block_summary(&thinking, out)?;
-            if !thinking.is_empty() {
-                events.push(AssistantEvent::ThinkingDelta(thinking));
-            }
-            if let Some(signature) = signature {
-                *pending_thinking_signature = Some(signature.clone());
-                events.push(AssistantEvent::ThinkingSignature(signature));
             }
         }
         OutputContentBlock::ToolUse { id, name, input } => {
@@ -2383,16 +2612,9 @@ fn response_to_events(
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
-    let mut pending_thinking_signature = None;
 
     for block in response.content {
-        push_output_block(
-            block,
-            out,
-            &mut events,
-            &mut pending_tool,
-            &mut pending_thinking_signature,
-        )?;
+        push_output_block(block, out, &mut events, &mut pending_tool)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -2477,29 +2699,26 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
-                    ContentBlock::Thinking { .. } => None,
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
+                    },
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => Some(InputContentBlock::ToolResult {
+                    } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    }),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -2527,12 +2746,13 @@ fn print_help() {
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
     println!("  rusty-claude-cli login");
     println!("  rusty-claude-cli logout");
+    println!("  rusty-claude-cli self-update");
+    println!("      Update the installed binary from the latest GitHub release");
     println!();
     println!("Flags:");
     println!("  --model MODEL              Override the active model");
     println!("  --output-format FORMAT     Non-interactive output format: text or json");
     println!("  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access");
-    println!("  --thinking                 Enable extended thinking with the default budget");
     println!("  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
     println!("  --version, -V              Print version and build information locally");
     println!();
@@ -2554,6 +2774,7 @@ fn print_help() {
     println!("  rusty-claude-cli --allowedTools read,glob \"summarize Cargo.toml\"");
     println!("  rusty-claude-cli --resume session.json /status /diff /export notes.txt");
     println!("  rusty-claude-cli login");
+    println!("  rusty-claude-cli self-update");
 }
 
 #[cfg(test)]
@@ -2562,10 +2783,11 @@ mod tests {
         filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
         format_model_report, format_model_switch_report, format_permissions_report,
         format_permissions_switch_report, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
-        parse_git_status_metadata, render_config_report, render_init_claude_md,
-        render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
-        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        format_tool_call_start, format_tool_result, is_newer_version, normalize_permission_mode,
+        normalize_version_tag, parse_args, parse_checksum_for_asset, parse_git_status_metadata,
+        render_config_report, render_init_claude_md, render_memory_report, render_repl_help,
+        render_update_report, resume_supported_slash_commands, select_release_assets,
+        status_context, CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use std::path::{Path, PathBuf};
@@ -2578,7 +2800,6 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
-                thinking: false,
             }
         );
     }
@@ -2598,7 +2819,6 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
-                thinking: false,
             }
         );
     }
@@ -2620,7 +2840,6 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
-                thinking: false,
             }
         );
     }
@@ -2638,6 +2857,64 @@ mod tests {
     }
 
     #[test]
+    fn parses_self_update_subcommand() {
+        assert_eq!(
+            parse_args(&["self-update".to_string()]).expect("self-update should parse"),
+            CliAction::SelfUpdate
+        );
+    }
+
+    #[test]
+    fn normalize_version_tag_trims_v_prefix() {
+        assert_eq!(normalize_version_tag("v0.1.0"), "0.1.0");
+        assert_eq!(normalize_version_tag("0.1.0"), "0.1.0");
+    }
+
+    #[test]
+    fn detects_when_latest_version_differs() {
+        assert!(!is_newer_version("0.1.0", "v0.1.0"));
+        assert!(is_newer_version("0.1.0", "v0.2.0"));
+    }
+
+    #[test]
+    fn parses_checksum_manifest_for_named_asset() {
+        let manifest = "abc123 *rusty-claude-cli\ndef456  other-file\n";
+        assert_eq!(
+            parse_checksum_for_asset(manifest, "rusty-claude-cli"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn select_release_assets_requires_checksum_file() {
+        let release = super::GitHubRelease {
+            tag_name: "v0.2.0".to_string(),
+            body: String::new(),
+            assets: vec![super::GitHubReleaseAsset {
+                name: "rusty-claude-cli".to_string(),
+                browser_download_url: "https://example.invalid/rusty-claude-cli".to_string(),
+            }],
+        };
+
+        let error = select_release_assets(&release).expect_err("missing checksum should error");
+        assert!(error.contains("checksum manifest"));
+    }
+
+    #[test]
+    fn update_report_includes_changelog_when_present() {
+        let report = render_update_report(
+            "Already up to date",
+            Some("0.1.0"),
+            Some("0.1.0"),
+            Some("No action taken."),
+            Some("- Added self-update"),
+        );
+        assert!(report.contains("Self-update"));
+        assert!(report.contains("Changelog"));
+        assert!(report.contains("- Added self-update"));
+    }
+
+    #[test]
     fn parses_permission_mode_flag() {
         let args = vec!["--permission-mode=read-only".to_string()];
         assert_eq!(
@@ -2646,7 +2923,6 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
-                thinking: false,
             }
         );
     }
@@ -2669,7 +2945,6 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::WorkspaceWrite,
-                thinking: false,
             }
         );
     }
@@ -2909,7 +3184,6 @@ mod tests {
                     cache_read_input_tokens: 1,
                 },
                 estimated_tokens: 128,
-                thinking_enabled: true,
             },
             "workspace-write",
             &super::StatusContext {
@@ -2973,7 +3247,7 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert!(context.discovered_config_files >= context.loaded_config_files);
+        assert!(context.discovered_config_files >= 3);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 
